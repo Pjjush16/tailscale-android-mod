@@ -60,15 +60,19 @@ jobs:
         
         # Use tool/go if available, otherwise use system go
         if [ -f "./tool/go" ]; then
+          echo "Using tool/go"
           ./tool/go mod tidy
         else
+          echo "Using system go"
           go mod tidy
         fi
         
         cd libtailscale
         if [ -f "../tool/go" ]; then
+          echo "Building with tool/go"
           ../tool/go build -buildmode=c-archive -o libtailscale.a .
         else
+          echo "Building with system go"
           go build -buildmode=c-archive -o libtailscale.a .
         fi
         
