@@ -69,10 +69,10 @@ jobs:
         # Build AAR using gomobile bind
         if [ -f "./tool/go" ]; then
           echo "Using tool/go for gomobile bind"
-          ./tool/go run golang.org/x/mobile/cmd/gomobile bind -target=android/arm,android/arm64 -o libtailscale.aar ./libtailscale
+          ./tool/go run golang.org/x/mobile/cmd/gomobile bind -androidapi=21 -target=android/arm,android/arm64 -o libtailscale.aar ./libtailscale
         else
           echo "Using system gomobile bind"
-          gomobile bind -target=android/arm,android/arm64 -o libtailscale.aar ./libtailscale
+          gomobile bind -androidapi=21 -target=android/arm,android/arm64 -o libtailscale.aar ./libtailscale
         fi
         
     - name: Build APK
