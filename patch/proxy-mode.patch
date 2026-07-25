@@ -1,0 +1,1118 @@
+diff --git a/android/src/main/AndroidManifest.xml b/android/src/main/AndroidManifest.xml
+old mode 100644
+new mode 100755
+index 9633e2b..1b1de7d
+--- a/android/src/main/AndroidManifest.xml
++++ b/android/src/main/AndroidManifest.xml
+@@ -119,6 +119,18 @@
+                 <action android:name="android.net.VpnService" />
+             </intent-filter>
+         </service>
++        <activity
++            android:name=".BuiltInBrowserActivity"
++            android:exported="false"
++            android:label="@string/app_name"
++            android:theme="@style/Theme.AppCompat.Light.NoActionBar">
++        </activity>
++
++        <service
++            android:name=".ProxyService"
++            android:exported="false"
++            android:foregroundServiceType="dataSync">
++        </service>
+         <service
+             android:name=".QuickToggleService"
+             android:exported="true"
+diff --git a/android/src/main/java/com/tailscale/ipn/App.kt b/android/src/main/java/com/tailscale/ipn/App.kt
+old mode 100644
+new mode 100755
+index 2d3ba02..9616835
+--- a/android/src/main/java/com/tailscale/ipn/App.kt
++++ b/android/src/main/java/com/tailscale/ipn/App.kt
+@@ -521,6 +521,8 @@ open class UninitializedApp : Application() {
+     private const val ALLOW_SELECTED_APPS_KEY = "allowSelectedApps"
+ 
+     private const val IS_CLIENT_LOGGING_ENABLED_KEY = "isClientLoggingEnabled"
++    private const val IS_SPLIT_TUNNEL_ENABLED_KEY = "isSplitTunnelEnabled"
++    private const val IS_PROXY_MODE_ENABLED_KEY = "isProxyModeEnabled"
+     // File for shared preferences that are not encrypted.
+     private const val UNENCRYPTED_PREFERENCES = "unencrypted"
+     private lateinit var appInstance: UninitializedApp
+@@ -552,11 +554,42 @@ open class UninitializedApp : Application() {
+   protected fun setAbleToStartVPN(rdy: Boolean) {
+     getUnencryptedPrefs().edit().putBoolean(ABLE_TO_START_VPN_KEY, rdy).apply()
+   }
++  
+   /** This function can be called without initializing the App. */
+   fun isAbleToStartVPN(): Boolean {
+     return getUnencryptedPrefs().getBoolean(ABLE_TO_START_VPN_KEY, false)
+   }
+ 
++  /**
++   * 启用/禁用分流模式
++   * 分流模式下只路由 Tailscale 流量 (100.64.0.0/10)，其他流量走系统默认路由
++   * 这样 Clash 等其他 VPN/代理软件可以同时工作
++   */
++  fun setSplitTunnelEnabled(enabled: Boolean) {
++    getUnencryptedPrefs().edit().putBoolean(IS_SPLIT_TUNNEL_ENABLED_KEY, enabled).apply()
++    TSLog.d(TAG, "Split tunnel mode ${if (enabled) "enabled" else "disabled"}")
++  }
++
++  /** 检查是否启用了分流模式 */
++  fun isSplitTunnelEnabled(): Boolean {
++    return getUnencryptedPrefs().getBoolean(IS_SPLIT_TUNNEL_ENABLED_KEY, false)
++  }
++
++  /**
++   * 启用/禁用代理模式
++   * 代理模式下使用 tsnet 在用户空间运行 Tailscale，不需要 VPN 权限
++   * 提供 SOCKS5 (127.0.0.1:1080) 和 HTTP (127.0.0.1:8080) 代理
++   */
++  fun setProxyModeEnabled(enabled: Boolean) {
++    getUnencryptedPrefs().edit().putBoolean(IS_PROXY_MODE_ENABLED_KEY, enabled).apply()
++    TSLog.d(TAG, "Proxy mode ${if (enabled) "enabled" else "disabled"}")
++  }
++
++  /** 检查是否启用了代理模式 */
++  fun isProxyModeEnabled(): Boolean {
++    return getUnencryptedPrefs().getBoolean(IS_PROXY_MODE_ENABLED_KEY, false)
++  }
++
+   private fun getUnencryptedPrefs(): SharedPreferences {
+     return getSharedPreferences(UNENCRYPTED_PREFERENCES, MODE_PRIVATE)
+   }
+diff --git a/android/src/main/java/com/tailscale/ipn/BuiltInBrowserActivity.kt b/android/src/main/java/com/tailscale/ipn/BuiltInBrowserActivity.kt
+new file mode 100755
+index 0000000..075f29e
+--- /dev/null
++++ b/android/src/main/java/com/tailscale/ipn/BuiltInBrowserActivity.kt
+@@ -0,0 +1,245 @@
++// Copyright (c) Tailscale Inc & AUTHORS
++// SPDX-License-Identifier: BSD-3-Clause
++
++package com.tailscale.ipn
++
++import android.annotation.SuppressLint
++import android.app.Activity
++import android.os.Bundle
++import android.util.Log
++import android.webkit.WebChromeClient
++import android.webkit.WebView
++import android.webkit.WebViewClient
++import android.widget.EditText
++import android.widget.ImageButton
++import android.widget.LinearLayout
++import android.widget.ProgressBar
++import androidx.appcompat.app.AppCompatActivity
++
++/**
++ * Built-in browser that automatically routes traffic through the Tailscale tunnel.
++ * This allows users to access HTTP/FTP services on the Tailnet without needing
++ * to configure a proxy in their browser.
++ */
++class BuiltInBrowserActivity : AppCompatActivity() {
++    private lateinit var webView: WebView
++    private lateinit var urlEditText: EditText
++    private lateinit var progressBar: ProgressBar
++
++    companion object {
++        private const val TAG = "BuiltInBrowser"
++        private const val PROXY_HOST = "127.0.0.1"
++        private const val PROXY_PORT = 8080
++    }
++
++    @SuppressLint("SetJavaScriptEnabled")
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++
++        // Create layout programmatically
++        val layout = LinearLayout(this).apply {
++            orientation = LinearLayout.VERTICAL
++        }
++
++        // URL bar
++        val urlBar = LinearLayout(this).apply {
++            orientation = LinearLayout.HORIZONTAL
++            setPadding(8, 8, 8, 8)
++        }
++
++        urlEditText = EditText(this).apply {
++            layoutParams = LinearLayout.LayoutParams(
++                0,
++                LinearLayout.LayoutParams.WRAP_CONTENT,
++                1f
++            )
++            hint = "http://100.x.x.x/"
++            setSingleLine(true)
++            inputType = android.text.InputType.TYPE_TEXT_VARIATION_URI
++        }
++
++        val goButton = ImageButton(this).apply {
++            setImageResource(android.R.drawable.ic_media_play)
++            setOnClickListener {
++                val url = urlEditText.text.toString()
++                if (url.isNotBlank()) {
++                    loadUrl(url)
++                }
++            }
++        }
++
++        val backButton = ImageButton(this).apply {
++            setImageResource(android.R.drawable.ic_media_rew)
++            setOnClickListener {
++                if (webView.canGoBack()) {
++                    webView.goBack()
++                }
++            }
++        }
++
++        val forwardButton = ImageButton(this).apply {
++            setImageResource(android.R.drawable.ic_media_ff)
++            setOnClickListener {
++                if (webView.canGoForward()) {
++                    webView.goForward()
++                }
++            }
++        }
++
++        urlBar.addView(backButton)
++        urlBar.addView(forwardButton)
++        urlBar.addView(urlEditText)
++        urlBar.addView(goButton)
++
++        // Progress bar
++        progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
++            layoutParams = LinearLayout.LayoutParams(
++                LinearLayout.LayoutParams.MATCH_PARENT,
++                4
++            )
++            max = 100
++        }
++
++        // WebView
++        webView = WebView(this).apply {
++            layoutParams = LinearLayout.LayoutParams(
++                LinearLayout.LayoutParams.MATCH_PARENT,
++                0,
++                1f
++            )
++            settings.javaScriptEnabled = true
++            settings.domStorageEnabled = true
++            settings.allowFileAccess = true
++            settings.allowContentAccess = true
++        }
++
++        // Configure proxy
++        configureProxy(webView)
++
++        webView.webViewClient = object : WebViewClient() {
++            override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
++                super.onPageStarted(view, url, favicon)
++                urlEditText.setText(url)
++            }
++
++            override fun onPageFinished(view: WebView?, url: String?) {
++                super.onPageFinished(view, url)
++                progressBar.visibility = android.view.View.GONE
++            }
++        }
++
++        webView.webChromeClient = object : WebChromeClient() {
++            override fun onProgressChanged(view: WebView?, newProgress: Int) {
++                super.onProgressChanged(view, newProgress)
++                if (newProgress < 100) {
++                    progressBar.visibility = android.view.View.VISIBLE
++                    progressBar.progress = newProgress
++                } else {
++                    progressBar.visibility = android.view.View.GONE
++                }
++            }
++        }
++
++        layout.addView(urlBar)
++        layout.addView(progressBar)
++        layout.addView(webView)
++
++        setContentView(layout)
++
++        // Load initial URL if provided
++        val initialUrl = intent.getStringExtra("url")
++        if (initialUrl != null) {
++            urlEditText.setText(initialUrl)
++            loadUrl(initialUrl)
++        } else {
++            // Show a welcome page
++            webView.loadData(
++                """
++                <html>
++                <head>
++                    <meta charset="UTF-8">
++                    <style>
++                        body { font-family: sans-serif; padding: 20px; background: #f0f0f0; }
++                        h1 { color: #333; }
++                        .info { background: white; padding: 15px; border-radius: 8px; margin: 10px 0; }
++                    </style>
++                </head>
++                <body>
++                    <h1>🌐 Tailscale 内置浏览器</h1>
++                    <div class="info">
++                        <p>此浏览器已自动配置代理，可以直接访问 Tailnet 内的 HTTP/FTP 服务。</p>
++                        <p>代理地址: $PROXY_HOST:$PROXY_PORT</p>
++                    </div>
++                    <div class="info">
++                        <h2>使用方法</h2>
++                        <ol>
++                            <li>在地址栏输入 URL（如 http://100.x.x.x/）</li>
++                            <li>点击播放按钮或按回车</li>
++                            <li>浏览器会通过 Tailscale 隧道访问目标</li>
++                        </ol>
++                    </div>
++                    <div class="info">
++                        <h2>示例</h2>
++                        <p>http://100.64.0.1/ - 访问 Tailnet 内的 HTTP 服务器</p>
++                        <p>http://100.64.0.2:8080/ - 访问带端口的服务</p>
++                    </div>
++                </body>
++                </html>
++                """.trimIndent(),
++                "text/html",
++                "UTF-8"
++            )
++        }
++    }
++
++    /**
++     * Configure WebView to use proxy.
++     * Note: On modern Android versions (API 21+), WebView proxy configuration
++     * is done via ProxyController. For older versions, we use the deprecated method.
++     */
++    @Suppress("DEPRECATION")
++    private fun configureProxy(webView: WebView) {
++        try {
++            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
++                // Use ProxyController for API 21+
++                val proxyController = android.webkit.ProxyController.getInstance()
++                proxyController.setProxyOverride(
++                    android.webkit.ProxyConfig.Builder()
++                        .addProxyRule("$PROXY_HOST:$PROXY_PORT")
++                        .build(),
++                    { it.run() },
++                    { it.run() }
++                )
++                Log.d(TAG, "Proxy configured using ProxyController: $PROXY_HOST:$PROXY_PORT")
++            } else {
++                // Fallback for older Android versions
++                val webViewClass = webView.javaClass
++                try {
++                    val method = webViewClass.getMethod("setHttpProxy", java.lang.Boolean.TYPE)
++                    method.invoke(webView, true)
++                } catch (e: Exception) {
++                    Log.w(TAG, "Failed to set proxy via reflection: ${e.message}")
++                }
++            }
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to configure proxy: ${e.message}")
++        }
++    }
++
++    private fun loadUrl(url: String) {
++        var targetUrl = url.trim()
++        // Add http:// if no protocol specified
++        if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
++            targetUrl = "http://$targetUrl"
++        }
++        webView.loadUrl(targetUrl)
++    }
++
++    override fun onBackPressed() {
++        if (webView.canGoBack()) {
++            webView.goBack()
++        } else {
++            super.onBackPressed()
++        }
++    }
++}
+diff --git a/android/src/main/java/com/tailscale/ipn/IPNService.kt b/android/src/main/java/com/tailscale/ipn/IPNService.kt
+old mode 100644
+new mode 100755
+index 848092f..4b8c4b2
+--- a/android/src/main/java/com/tailscale/ipn/IPNService.kt
++++ b/android/src/main/java/com/tailscale/ipn/IPNService.kt
+@@ -182,46 +182,62 @@ open class IPNService : VpnService(), libtailscale.IPNService {
+     }
+     b.setUnderlyingNetworks(null) // Use all available networks.
+ 
+-    val mdmAllowed =
+-        MDMSettings.includedPackages.flow.value.value?.split(",")?.map { it.trim() } ?: emptyList()
+-    val mdmDisallowed =
+-        MDMSettings.excludedPackages.flow.value.value?.split(",")?.map { it.trim() } ?: emptyList()
+-
+-    var packagesList: List<String>
+-    var allowPackages: Boolean
+-    if (mdmAllowed.isNotEmpty()) {
+-      // An admin defined a list of packages that are exclusively allowed to be used via
+-      // Tailscale, so only allow those.
+-      packagesList = mdmAllowed
+-      allowPackages = true
+-      TSLog.d(TAG, "Included application packages were set via MDM: $mdmAllowed")
+-    } else if (mdmDisallowed.isNotEmpty()) {
+-      // An admin defined a list of packages that are excluded from accessing Tailscale,
+-      // so ignore user definitions and only exclude those
+-      packagesList = mdmDisallowed
+-      allowPackages = false
+-      TSLog.d(TAG, "Excluded application packages were set via MDM: $mdmDisallowed")
+-    } else {
+-      // Otherwise, prevent user manually disallowed apps from getting their traffic + DNS routed
+-      // via Tailscale
+-      packagesList = UninitializedApp.get().selectedPackageNames()
+-      allowPackages = UninitializedApp.get().allowSelectedPackages()
+-      TSLog.d(TAG, "Application packages were set by user: $packagesList")
+-    }
+-
+-    if (allowPackages) {
+-      for (packageName in packagesList) {
+-        TSLog.d(TAG, "Including app: $packageName")
+-        allowApp(b, packageName)
++    // 检查是否启用了分流模式（只路由 Tailscale 流量）
++    val splitTunnelMode = UninitializedApp.get().isSplitTunnelEnabled()
++    
++    if (!splitTunnelMode) {
++      // 正常模式：接管所有流量
++      val mdmAllowed =
++          MDMSettings.includedPackages.flow.value.value?.split(",")?.map { it.trim() } ?: emptyList()
++      val mdmDisallowed =
++          MDMSettings.excludedPackages.flow.value.value?.split(",")?.map { it.trim() } ?: emptyList()
++
++      var packagesList: List<String>
++      var allowPackages: Boolean
++      if (mdmAllowed.isNotEmpty()) {
++        // An admin defined a list of packages that are exclusively allowed to be used via
++        // Tailscale, so only allow those.
++        packagesList = mdmAllowed
++        allowPackages = true
++        TSLog.d(TAG, "Included application packages were set via MDM: $mdmAllowed")
++      } else if (mdmDisallowed.isNotEmpty()) {
++        // An admin defined a list of packages that are excluded from accessing Tailscale,
++        // so ignore user definitions and only exclude those
++        packagesList = mdmDisallowed
++        allowPackages = false
++        TSLog.d(TAG, "Excluded application packages were set via MDM: $mdmDisallowed")
++      } else {
++        // Otherwise, prevent user manually disallowed apps from getting their traffic + DNS routed
++        // via Tailscale
++        packagesList = UninitializedApp.get().selectedPackageNames()
++        allowPackages = UninitializedApp.get().allowSelectedPackages()
++        TSLog.d(TAG, "Application packages were set by user: $packagesList")
+       }
+-    } else {
+-      // Make sure to also exclude hard-coded apps that are known to cause issues
+-      packagesList += UninitializedApp.get().builtInDisallowedPackageNames
+ 
+-      for (packageName in packagesList) {
+-        TSLog.d(TAG, "Disallowing app: $packageName")
+-        disallowApp(b, packageName)
++      if (allowPackages) {
++        for (packageName in packagesList) {
++          TSLog.d(TAG, "Including app: $packageName")
++          allowApp(b, packageName)
++        }
++      } else {
++        // Make sure to also exclude hard-coded apps that are known to cause issues
++        packagesList += UninitializedApp.get().builtInDisallowedPackageNames
++
++        for (packageName in packagesList) {
++          TSLog.d(TAG, "Disallowing app: $packageName")
++          disallowApp(b, packageName)
++        }
+       }
++    } else {
++      // 分流模式：只路由 Tailscale IP 段 (100.64.0.0/10)
++      // 其他流量走系统默认路由，这样 Clash 等其他 VPN/代理可以继续工作
++      TSLog.d(TAG, "Split tunnel mode: only routing Tailscale traffic (100.64.0.0/10)")
++      
++      // 添加 Tailscale IP 段路由
++      b.addRoute("100.64.0.0", 10)  // 100.64.0.0 - 100.127.255.255
++      
++      // 不添加默认路由（0.0.0.0/0），其他流量走系统
++      // 这样 Clash 等代理软件可以正常工作
+     }
+ 
+     return VPNServiceBuilder(b)
+diff --git a/android/src/main/java/com/tailscale/ipn/ui/view/SettingsView.kt b/android/src/main/java/com/tailscale/ipn/ui/view/SettingsView.kt
+old mode 100644
+new mode 100755
+index 64adf63..4cb65d8
+--- a/android/src/main/java/com/tailscale/ipn/ui/view/SettingsView.kt
++++ b/android/src/main/java/com/tailscale/ipn/ui/view/SettingsView.kt
+@@ -3,12 +3,14 @@
+ 
+ package com.tailscale.ipn.ui.view
+ 
++import android.content.Intent
+ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Button
+ import androidx.compose.material3.ListItem
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Scaffold
+@@ -22,6 +24,7 @@ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.platform.LocalUriHandler
+ import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.SpanStyle
+@@ -29,8 +32,10 @@ import androidx.compose.ui.text.buildAnnotatedString
+ import androidx.compose.ui.text.style.TextDecoration
+ import androidx.compose.ui.text.withStyle
+ import androidx.compose.ui.tooling.preview.Preview
++import androidx.compose.ui.unit.dp
+ import androidx.lifecycle.viewmodel.compose.viewModel
+ import com.tailscale.ipn.BuildConfig
++import com.tailscale.ipn.BuiltInBrowserActivity
+ import com.tailscale.ipn.R
+ import com.tailscale.ipn.mdm.AlwaysNeverUserDecides
+ import com.tailscale.ipn.mdm.MDMSettings
+@@ -64,6 +69,8 @@ fun SettingsView(
+   val showTailnetLock by MDMSettings.manageTailnetLock.flow.collectAsState()
+   val useTailscaleSubnets by MDMSettings.useTailscaleSubnets.flow.collectAsState()
+   val isClientRemoteLoggingEnabled by viewModel.isClientRemoteLoggingEnabled.collectAsState()
++  val isSplitTunnelEnabled by viewModel.isSplitTunnelEnabled.collectAsState()
++  val isProxyModeEnabled by viewModel.isProxyModeEnabled.collectAsState()
+   var showDisableLoggingDialog by remember { mutableStateOf(false) }
+ 
+   Scaffold(
+@@ -132,6 +139,56 @@ fun SettingsView(
+                 }
+               })
+ 
++          Lists.ItemDivider()
++          Setting.Switch(
++              title = "Split Tunnel Mode (分流模式)",
++              subtitle =
++                  "Only route Tailscale traffic (100.64.0.0/10). " +
++                  "Other traffic uses system default route. " +
++                  "This allows other VPN/proxy apps (like Clash) to work simultaneously. " +
++                  "Requires VPN restart to take effect.",
++              isOn = isSplitTunnelEnabled,
++              onToggle = { viewModel.toggleSplitTunnel() })
++
++          Lists.ItemDivider()
++          Setting.Switch(
++              title = "Proxy Mode (代理模式)",
++              subtitle =
++                  "Run Tailscale as a local SOCKS5/HTTP proxy without VPN permission. " +
++                  "SOCKS5: 127.0.0.1:1080 | HTTP: 127.0.0.1:8080. " +
++                  "Does not interfere with other VPN/proxy apps. " +
++                  "Configure your apps to use the proxy to access Tailnet.",
++              isOn = isProxyModeEnabled,
++              onToggle = { viewModel.toggleProxyMode() })
++
++          if (isProxyModeEnabled) {
++            Lists.ItemDivider()
++            val context = LocalContext.current
++            Column(
++                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
++            ) {
++              Text(
++                  text = "Built-in Browser (内置浏览器)",
++                  style = MaterialTheme.typography.titleMedium,
++                  modifier = Modifier.padding(bottom = 4.dp)
++              )
++              Text(
++                  text = "Access HTTP/FTP services on Tailnet without configuring proxy in browser.",
++                  style = MaterialTheme.typography.bodySmall,
++                  color = MaterialTheme.colorScheme.onSurfaceVariant,
++                  modifier = Modifier.padding(bottom = 8.dp)
++              )
++              Button(
++                  onClick = {
++                    val intent = Intent(context, BuiltInBrowserActivity::class.java)
++                    context.startActivity(intent)
++                  }
++              ) {
++                Text("Open Browser (打开浏览器)")
++              }
++            }
++          }
++
+           if (!AndroidTVUtil.isAndroidTV()) {
+             Lists.ItemDivider()
+             Setting.Text(R.string.permissions, onClick = settingsNav.onNavigateToPermissions)
+diff --git a/android/src/main/java/com/tailscale/ipn/ui/viewModel/SettingsViewModel.kt b/android/src/main/java/com/tailscale/ipn/ui/viewModel/SettingsViewModel.kt
+old mode 100644
+new mode 100755
+index e0fbc91..e57975d
+--- a/android/src/main/java/com/tailscale/ipn/ui/viewModel/SettingsViewModel.kt
++++ b/android/src/main/java/com/tailscale/ipn/ui/viewModel/SettingsViewModel.kt
+@@ -36,9 +36,15 @@ class SettingsViewModel : IpnViewModel() {
+   // True if tailscaleDNS is enabled. nil if not yet known.
+   val corpDNSEnabled: StateFlow<Boolean?> = MutableStateFlow(null)
+   val isClientRemoteLoggingEnabled: StateFlow<Boolean> = MutableStateFlow(true)
++  // 分流模式：只路由 Tailscale 流量，其他流量走系统默认路由
++  val isSplitTunnelEnabled: StateFlow<Boolean> = MutableStateFlow(false)
++  // 代理模式：使用 tsnet 代理而不是 VPN
++  val isProxyModeEnabled: StateFlow<Boolean> = MutableStateFlow(false)
+ 
+   init {
+     isClientRemoteLoggingEnabled.set(App.get().isClientLoggingEnabled())
++    isSplitTunnelEnabled.set(App.get().isSplitTunnelEnabled())
++    isProxyModeEnabled.set(App.get().isProxyModeEnabled())
+ 
+     viewModelScope.launch {
+       Notifier.netmap.collect { netmap -> isAdmin.set(netmap?.SelfNode?.isAdmin ?: false) }
+@@ -61,4 +67,14 @@ class SettingsViewModel : IpnViewModel() {
+     isClientRemoteLoggingEnabled.set(!isClientRemoteLoggingEnabled.value)
+     App.get().updateIsClientLoggingEnabled(isClientRemoteLoggingEnabled.value)
+   }
++
++  fun toggleSplitTunnel() {
++    isSplitTunnelEnabled.set(!isSplitTunnelEnabled.value)
++    App.get().setSplitTunnelEnabled(isSplitTunnelEnabled.value)
++  }
++
++  fun toggleProxyMode() {
++    isProxyModeEnabled.set(!isProxyModeEnabled.value)
++    App.get().setProxyModeEnabled(isProxyModeEnabled.value)
++  }
+ }
+diff --git a/libtailscale/proxy.go b/libtailscale/proxy.go
+new file mode 100755
+index 0000000..2d48d89
+--- /dev/null
++++ b/libtailscale/proxy.go
+@@ -0,0 +1,90 @@
++// Copyright (c) NetLink contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++// Proxy controller - exposes proxy server functions for Java/Kotlin
++
++package libtailscale
++
++import (
++	"fmt"
++	"log"
++	"sync"
++)
++
++var (
++	globalProxy     *ProxyServer
++	globalProxyLock sync.Mutex
++)
++
++// StartProxy starts the tsnet-based proxy server.
++// Called from Java/Kotlin via gomobile.
++func StartProxy(dataDir string, hostname string, socksPort int, httpPort int) error {
++	globalProxyLock.Lock()
++	defer globalProxyLock.Unlock()
++
++	if globalProxy != nil && globalProxy.IsRunning() {
++		return fmt.Errorf("proxy already running")
++	}
++
++	log.Printf("Starting proxy: dataDir=%s hostname=%s socks=%d http=%d", 
++		dataDir, hostname, socksPort, httpPort)
++
++	globalProxy = NewProxyServer(dataDir, hostname, socksPort, httpPort)
++	
++	if err := globalProxy.Start(); err != nil {
++		globalProxy = nil
++		return fmt.Errorf("start proxy: %w", err)
++	}
++
++	return nil
++}
++
++// StopProxy stops the proxy server.
++func StopProxy() {
++	globalProxyLock.Lock()
++	defer globalProxyLock.Unlock()
++
++	if globalProxy != nil {
++		log.Printf("Stopping proxy")
++		globalProxy.Stop()
++		globalProxy = nil
++	}
++}
++
++// IsProxyRunning returns whether the proxy is running.
++func IsProxyRunning() bool {
++	globalProxyLock.Lock()
++	defer globalProxyLock.Unlock()
++	return globalProxy != nil && globalProxy.IsRunning()
++}
++
++// GetProxyAuthURL returns the auth URL if login is needed.
++func GetProxyAuthURL() string {
++	globalProxyLock.Lock()
++	defer globalProxyLock.Unlock()
++	if globalProxy == nil {
++		return ""
++	}
++	return globalProxy.GetAuthURL()
++}
++
++// GetProxyIPs returns the Tailscale IPs assigned to this proxy node.
++func GetProxyIPs() string {
++	globalProxyLock.Lock()
++	defer globalProxyLock.Unlock()
++	if globalProxy == nil {
++		return ""
++	}
++	ips := globalProxy.GetIPs()
++	if len(ips) == 0 {
++		return ""
++	}
++	result := ""
++	for i, ip := range ips {
++		if i > 0 {
++			result += ","
++		}
++		result += ip
++	}
++	return result
++}
+diff --git a/libtailscale/proxyserver.go b/libtailscale/proxyserver.go
+new file mode 100755
+index 0000000..d97a2e1
+--- /dev/null
++++ b/libtailscale/proxyserver.go
+@@ -0,0 +1,433 @@
++// Copyright (c) NetLink contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++// Package libtailscale - proxy server mode using tsnet
++// This provides a SOCKS5 + HTTP proxy without requiring VPN permissions.
++
++package libtailscale
++
++import (
++	"context"
++	"encoding/binary"
++	"fmt"
++	"io"
++	"log"
++	"net"
++	"net/http"
++	"strings"
++	"sync"
++	"time"
++
++	"tailscale.com/tsnet"
++)
++
++// ProxyServer runs a SOCKS5/HTTP proxy backed by tsnet.
++type ProxyServer struct {
++	ts         *tsnet.Server
++	socksLn    net.Listener
++	httpLn     net.Listener
++	socksPort  int
++	httpPort   int
++	ctx        context.Context
++	cancel     context.CancelFunc
++	wg         sync.WaitGroup
++	dataDir    string
++	hostname   string
++	running    bool
++	mu         sync.Mutex
++	onStatusChange func(string)
++}
++
++// NewProxyServer creates a new tsnet-backed proxy server.
++func NewProxyServer(dataDir string, hostname string, socksPort int, httpPort int) *ProxyServer {
++	ctx, cancel := context.WithCancel(context.Background())
++	return &ProxyServer{
++		dataDir:   dataDir,
++		hostname:  hostname,
++		socksPort: socksPort,
++		httpPort:  httpPort,
++		ctx:       ctx,
++		cancel:    cancel,
++	}
++}
++
++// Start starts the proxy server.
++func (ps *ProxyServer) Start() error {
++	ps.mu.Lock()
++	defer ps.mu.Unlock()
++
++	if ps.running {
++		return fmt.Errorf("proxy server already running")
++	}
++
++	ps.ts = &tsnet.Server{
++		Dir:      ps.dataDir,
++		Hostname: ps.hostname,
++	}
++
++	// Start tsnet
++	if err := ps.ts.Start(); err != nil {
++		return fmt.Errorf("tsnet start: %w", err)
++	}
++
++	// Wait for tsnet to be ready
++	ctx, cancel := context.WithTimeout(ps.ctx, 60*time.Second)
++	defer cancel()
++
++	// Wait until the node is up
++	lc, err := ps.ts.LocalClient()
++	if err != nil {
++		ps.ts.Close()
++		return fmt.Errorf("tsnet local client: %w", err)
++	}
++
++	for {
++		status, err := lc.Status(ctx)
++		if err != nil {
++			ps.ts.Close()
++			return fmt.Errorf("tsnet status: %w", err)
++		}
++		if status.BackendState == "Running" {
++			break
++		}
++		select {
++		case <-ctx.Done():
++			ps.ts.Close()
++			return fmt.Errorf("timeout waiting for tsnet to start")
++		case <-time.After(500 * time.Millisecond):
++		}
++	}
++
++	// Start SOCKS5 proxy
++	socksAddr := fmt.Sprintf(":%d", ps.socksPort)
++	ps.socksLn, err = net.Listen("tcp", socksAddr)
++	if err != nil {
++		ps.ts.Close()
++		return fmt.Errorf("socks5 listen: %w", err)
++	}
++	ps.wg.Add(1)
++	go ps.socksLoop()
++
++	// Start HTTP proxy
++	httpAddr := fmt.Sprintf(":%d", ps.httpPort)
++	ps.httpLn, err = net.Listen("tcp", httpAddr)
++	if err != nil {
++		ps.socksLn.Close()
++		ps.ts.Close()
++		return fmt.Errorf("http proxy listen: %w", err)
++	}
++	ps.wg.Add(1)
++	go ps.httpLoop()
++
++	ps.running = true
++	log.Printf("Proxy server started: SOCKS5 on :%d, HTTP on :%d", ps.socksPort, ps.httpPort)
++
++	if ps.onStatusChange != nil {
++		ps.onStatusChange("running")
++	}
++
++	return nil
++}
++
++// Stop stops the proxy server.
++func (ps *ProxyServer) Stop() {
++	ps.mu.Lock()
++	if !ps.running {
++		ps.mu.Unlock()
++		return
++	}
++	ps.running = false
++	ps.mu.Unlock()
++
++	ps.cancel()
++
++	if ps.socksLn != nil {
++		ps.socksLn.Close()
++	}
++	if ps.httpLn != nil {
++		ps.httpLn.Close()
++	}
++	if ps.ts != nil {
++		ps.ts.Close()
++	}
++
++	ps.wg.Wait()
++	log.Printf("Proxy server stopped")
++
++	if ps.onStatusChange != nil {
++		ps.onStatusChange("stopped")
++	}
++}
++
++// IsRunning returns whether the proxy is running.
++func (ps *ProxyServer) IsRunning() bool {
++	ps.mu.Lock()
++	defer ps.mu.Unlock()
++	return ps.running
++}
++
++// SetStatusCallback sets a callback for status changes.
++func (ps *ProxyServer) SetStatusCallback(fn func(string)) {
++	ps.onStatusChange = fn
++}
++
++// GetAuthURL returns the tsnet auth URL if login is needed.
++func (ps *ProxyServer) GetAuthURL() string {
++	if ps.ts == nil {
++		return ""
++	}
++	lc, err := ps.ts.LocalClient()
++	if err != nil {
++		return ""
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	status, err := lc.Status(ctx)
++	if err != nil {
++		return ""
++	}
++	if status.BackendState == "NeedsLogin" {
++		return status.AuthURL
++	}
++	return ""
++}
++
++// GetIPs returns the Tailscale IPs assigned to this node.
++func (ps *ProxyServer) GetIPs() []string {
++	if ps.ts == nil {
++		return nil
++	}
++	lc, err := ps.ts.LocalClient()
++	if err != nil {
++		return nil
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	status, err := lc.Status(ctx)
++	if err != nil {
++		return nil
++	}
++	ips := make([]string, 0, len(status.TailscaleIPs))
++	for _, ip := range status.TailscaleIPs {
++		ips = append(ips, ip.String())
++	}
++	return ips
++}
++
++// ===== SOCKS5 Proxy =====
++
++func (ps *ProxyServer) socksLoop() {
++	defer ps.wg.Done()
++	for {
++		conn, err := ps.socksLn.Accept()
++		if err != nil {
++			select {
++			case <-ps.ctx.Done():
++				return
++			default:
++				continue
++			}
++		}
++		ps.wg.Add(1)
++		go ps.handleSocks5(conn)
++	}
++}
++
++func (ps *ProxyServer) handleSocks5(conn net.Conn) {
++	defer ps.wg.Done()
++	defer conn.Close()
++
++	// SOCKS5 handshake
++	buf := make([]byte, 258)
++	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
++		return
++	}
++	if buf[0] != 0x05 {
++		return
++	}
++
++	nMethods := int(buf[1])
++	if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil {
++		return
++	}
++
++	// No auth
++	conn.Write([]byte{0x05, 0x00})
++
++	// Read connect request
++	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
++		return
++	}
++	if buf[0] != 0x05 || buf[1] != 0x01 { // Only CONNECT
++		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
++		return
++	}
++
++	var targetAddr string
++	switch buf[3] {
++	case 0x01: // IPv4
++		if _, err := io.ReadFull(conn, buf[:4]); err != nil {
++			return
++		}
++		if _, err := io.ReadFull(conn, buf[4:6]); err != nil {
++			return
++		}
++		port := binary.BigEndian.Uint16(buf[4:6])
++		targetAddr = fmt.Sprintf("%d.%d.%d.%d:%d", buf[0], buf[1], buf[2], buf[3], port)
++	case 0x03: // Domain
++		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
++			return
++		}
++		domLen := int(buf[0])
++		if _, err := io.ReadFull(conn, buf[:domLen]); err != nil {
++			return
++		}
++		domain := string(buf[:domLen])
++		if _, err := io.ReadFull(conn, buf[:2]); err != nil {
++			return
++		}
++		port := binary.BigEndian.Uint16(buf[:2])
++		targetAddr = fmt.Sprintf("%s:%d", domain, port)
++	case 0x04: // IPv6
++		if _, err := io.ReadFull(conn, buf[:16]); err != nil {
++			return
++		}
++		if _, err := io.ReadFull(conn, buf[16:18]); err != nil {
++			return
++		}
++		port := binary.BigEndian.Uint16(buf[16:18])
++		ip := net.IP(buf[:16])
++		targetAddr = fmt.Sprintf("[%s]:%d", ip, port)
++	default:
++		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
++		return
++	}
++
++	// Connect via tsnet
++	remote, err := ps.ts.Dial(ps.ctx, "tcp", targetAddr)
++	if err != nil {
++		conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
++		return
++	}
++	defer remote.Close()
++
++	// Success
++	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
++
++	// Bidirectional copy
++	done := make(chan struct{}, 2)
++	go func() { io.Copy(remote, conn); done <- struct{}{} }()
++	go func() { io.Copy(conn, remote); done <- struct{}{} }()
++	<-done
++}
++
++// ===== HTTP Proxy =====
++
++func (ps *ProxyServer) httpLoop() {
++	defer ps.wg.Done()
++	srv := &http.Server{
++		Handler: http.HandlerFunc(ps.handleHTTP),
++	}
++	go func() {
++		<-ps.ctx.Done()
++		srv.Close()
++	}()
++	srv.Serve(ps.httpLn)
++}
++
++func (ps *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
++	if r.Method == http.MethodConnect {
++		ps.handleHTTPConnect(w, r)
++		return
++	}
++
++	// Regular HTTP proxy: forward through tsnet
++	host := r.URL.Host
++	if !strings.Contains(host, ":") {
++		host += ":80"
++	}
++
++	remote, err := ps.ts.Dial(r.Context(), "tcp", host)
++	if err != nil {
++		http.Error(w, "Connection failed", http.StatusBadGateway)
++		return
++	}
++	defer remote.Close()
++
++	// Remove proxy headers
++	r.Header.Del("Proxy-Connection")
++	r.RequestURI = ""
++	r.URL.Scheme = "http"
++
++	if err := r.Write(remote); err != nil {
++		http.Error(w, "Write failed", http.StatusBadGateway)
++		return
++	}
++
++	// Read response and forward back
++	hjc := newHijackConn(w)
++	defer hjc.Close()
++
++	done := make(chan struct{}, 2)
++	go func() { io.Copy(hjc, remote); done <- struct{}{} }()
++	go func() { io.Copy(remote, hjc); done <- struct{}{} }()
++	<-done
++}
++
++func (ps *ProxyServer) handleHTTPConnect(w http.ResponseWriter, r *http.Request) {
++	target, err := ps.ts.Dial(r.Context(), "tcp", r.Host)
++	if err != nil {
++		http.Error(w, "Connection failed", http.StatusBadGateway)
++		return
++	}
++
++	hijacker, ok := w.(http.Hijacker)
++	if !ok {
++		target.Close()
++		http.Error(w, "Hijack not supported", http.StatusInternalServerError)
++		return
++	}
++
++	client, _, err := hijacker.Hijack()
++	if err != nil {
++		target.Close()
++		return
++	}
++
++	client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
++
++	done := make(chan struct{}, 2)
++	go func() { io.Copy(target, client); done <- struct{}{} }()
++	go func() { io.Copy(client, target); done <- struct{}{} }()
++	<-done
++	target.Close()
++	client.Close()
++}
++
++// hijackConn wraps ResponseWriter for raw TCP forwarding
++type hijackConn struct {
++	w   http.ResponseWriter
++	rc  io.ReadCloser
++}
++
++func newHijackConn(w http.ResponseWriter) *hijackConn {
++	return &hijackConn{w: w}
++}
++
++func (h *hijackConn) Read(b []byte) (int, error) {
++	if h.rc == nil {
++		return 0, io.EOF
++	}
++	return h.rc.Read(b)
++}
++
++func (h *hijackConn) Write(b []byte) (int, error) {
++	return h.w.Write(b)
++}
++
++func (h *hijackConn) Close() error {
++	if h.rc != nil {
++		return h.rc.Close()
++	}
++	return nil
++}
