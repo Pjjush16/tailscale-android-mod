@@ -58,22 +58,22 @@ jobs:
         export ANDROID_NDK_HOME=/opt/android-sdk/ndk/25.2.9519653
         export PATH=$PATH:$ANDROID_HOME/platform-tools
         
-        # Use tool/go if available, otherwise use system go
+        # Run go mod tidy from root directory
         if [ -f "./tool/go" ]; then
-          echo "Using tool/go"
+          echo "Using tool/go for mod tidy"
           ./tool/go mod tidy
         else
-          echo "Using system go"
+          echo "Using system go for mod tidy"
           go mod tidy
         fi
         
-        cd libtailscale
-        if [ -f "../tool/go" ]; then
-          echo "Building with tool/go"
-          ../tool/go build -buildmode=c-archive -o libtailscale.a .
+        # Build AAR from root directory (tool/go handles the path)
+        if [ -f "./tool/go" ]; then
+          echo "Building libtailscale AAR with tool/go"
+          ./tool/go build -buildmode=c-archive -o libtailscale/libtailscale.a ./libtailscale
         else
-          echo "Building with system go"
-          go build -buildmode=c-archive -o libtailscale.a .
+          echo "Building libtailscale AAR with system go"
+          go build -buildmode=c-archive -o libtailscale/libtailscale.a ./libtailscale
         fi
         
     - name: Build APK
