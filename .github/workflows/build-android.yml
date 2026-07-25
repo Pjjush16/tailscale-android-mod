@@ -78,10 +78,9 @@ jobs:
     - name: Create tailscale.version file
       run: |
         cd tailscale-android
-        cat > tailscale.version << 'EOF'
-        TAILSCALE_VERSION="1.70.0"
-        TAILSCALE_VERSION_CODE="100700000"
-        EOF
+        # Generate version file using mkversion tool
+        ./tool/go run tailscale.com/cmd/mkversion > tailscale.version
+        cat tailscale.version
         
     - name: Build APK
       run: |
