@@ -75,6 +75,14 @@ jobs:
           gomobile bind -androidapi=21 -target=android/arm,android/arm64 -o libtailscale.aar ./libtailscale
         fi
         
+    - name: Create tailscale.version file
+      run: |
+        cd tailscale-android
+        cat > tailscale.version << 'EOF'
+        TAILSCALE_VERSION="1.70.0"
+        TAILSCALE_VERSION_CODE="100700000"
+        EOF
+        
     - name: Build APK
       run: |
         cd tailscale-android/android
