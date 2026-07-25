@@ -42,6 +42,11 @@ jobs:
         cd /opt/android-sdk
         cmdline-tools/latest/bin/sdkmanager "ndk;25.2.9519653"
         
+    - name: Install gomobile
+      run: |
+        go install golang.org/x/mobile/cmd/gomobile@latest
+        go install golang.org/x/mobile/cmd/gobind@latest
+        
     - name: Clone Tailscale Android
       run: |
         git clone --depth 1 https://github.com/tailscale/tailscale-android.git
@@ -56,24 +61,18 @@ jobs:
         cd tailscale-android
         export ANDROID_HOME=/opt/android-sdk
         export ANDROID_NDK_HOME=/opt/android-sdk/ndk/25.2.9519653
-        export PATH=$PATH:$ANDROID_HOME/platform-tools
+        export PATH=$PATH:$ANDROID_HOME/platform-tools:$HOME/go/bin
         
-        # Run go mod tidy from root directory
-        if [ -f "./tool/go" ]; then
-          echo "Using tool/go for mod tidy"
-          ./tool/go mod tidy
-        else
-          echo "Using system go for mod tidy"
-          go mod tidy
-        fi
+        # Initialize gomobile
+        gomobile init
         
-        # Build AAR from root directory (tool/go handles the path)
+        # Build AAR using gomobile bind
         if [ -f "./tool/go" ]; then
-          echo "Building libtailscale AAR with tool/go"
-          ./tool/go build -buildmode=c-archive -o libtailscale/libtailscale.a ./libtailscale
+          echo "Using tool/go for gomobile bind"
+          ./tool/go run golang.org/x/mobile/cmd/gomobile bind -target=android/arm,android/arm64 -o libtailscale.aar ./libtailscale
         else
-          echo "Building libtailscale AAR with system go"
-          go build -buildmode=c-archive -o libtailscale/libtailscale.a ./libtailscale
+          echo "Using system gomobile bind"
+          gomobile bind -target=android/arm,android/arm64 -o libtailscale.aar ./libtailscale
         fi
         
     - name: Build APK
