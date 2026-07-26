@@ -194,31 +194,17 @@ class BuiltInBrowserActivity : AppCompatActivity() {
 
     /**
      * Configure WebView to use proxy.
-     * Note: On modern Android versions (API 29+), WebView proxy configuration
-     * is done via ProxyController. For older versions, we use the deprecated method.
+     * Uses system properties which work on all Android versions.
      */
     @Suppress("DEPRECATION")
     private fun configureProxy(webView: WebView) {
         try {
-            if (android.os.Build.VERSION.SDK_INT >= 29) {
-                // Use ProxyController for API 29+
-                val proxyController = android.webkit.ProxyController.getInstance()
-                proxyController.setProxyOverride(
-                    android.webkit.ProxyConfig.Builder()
-                        .addProxyRule("$PROXY_HOST:$PROXY_PORT")
-                        .build(),
-                    { it.run() },
-                    { it.run() }
-                )
-                Log.d(TAG, "Proxy configured using ProxyController: $PROXY_HOST:$PROXY_PORT")
-            } else {
-                // Fallback for older Android versions - use system proxy settings
-                Log.d(TAG, "ProxyController not available, using system proxy")
-                System.setProperty("http.proxyHost", PROXY_HOST)
-                System.setProperty("http.proxyPort", PROXY_PORT.toString())
-                System.setProperty("https.proxyHost", PROXY_HOST)
-                System.setProperty("https.proxyPort", PROXY_PORT.toString())
-            }
+            // Use system properties for proxy configuration (works on all Android versions)
+            System.setProperty("http.proxyHost", PROXY_HOST)
+            System.setProperty("http.proxyPort", PROXY_PORT.toString())
+            System.setProperty("https.proxyHost", PROXY_HOST)
+            System.setProperty("https.proxyPort", PROXY_PORT.toString())
+            Log.d(TAG, "Proxy configured using system properties: $PROXY_HOST:$PROXY_PORT")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to configure proxy: ${e.message}")
         }
