@@ -46,39 +46,48 @@ jobs:
       run: |
         go install golang.org/x/mobile/cmd/gomobile@latest
         go install golang.org/x/mobile/cmd/gobind@latest
+        echo "$HOME/go/bin" >> $GITHUB_PATH
         
     - name: Clone Tailscale Android
       run: |
         git clone --depth 1 https://github.com/tailscale/tailscale-android.git
         
-    - name: Apply patch
+    - name: Apply modifications
       run: |
         cd tailscale-android
-        patch -p1 < ../patch/proxy-mode.patch
+        
+        # Copy modified files from our repo
+        cp ../android/src/main/java/com/tailscale/ipn/BuiltInBrowserActivity.kt android/src/main/java/com/tailscale/ipn/
+        cp ../android/src/main/java/com/tailscale/ipn/App.kt android/src/main/java/com/tailscale/ipn/
+        cp ../android/src/main/java/com/tailscale/ipn/IPNService.kt android/src/main/java/com/tailscale/ipn/
+        cp ../android/src/main/java/com/tailscale/ipn/ui/view/SettingsView.kt android/src/main/java/com/tailscale/ipn/ui/view/
+        cp ../android/src/main/java/com/tailscale/ipn/ui/viewModel/SettingsViewModel.kt android/src/main/java/com/tailscale/ipn/ui/viewModel/
+        cp ../android/src/main/AndroidManifest.xml android/src/main/
+        cp ../libtailscale/proxy.go libtailscale/
+        cp ../libtailscale/proxyserver.go libtailscale/
+        
+        echo "Modified files copied successfully"
+        
+    - name: Initialize gomobile
+      run: |
+        export PATH=$PATH:$HOME/go/bin
+        export ANDROID_HOME=/opt/android-sdk
+        export ANDROID_NDK_HOME=/opt/android-sdk/ndk/25.2.9519653
+        cd tailscale-android
+        gomobile init
         
     - name: Build libtailscale AAR
       run: |
         cd tailscale-android
         export ANDROID_HOME=/opt/android-sdk
         export ANDROID_NDK_HOME=/opt/android-sdk/ndk/25.2.9519653
-        export PATH=$PATH:$ANDROID_HOME/platform-tools:$HOME/go/bin
-        
-        # Initialize gomobile
-        gomobile init
-        
-        # Build AAR using gomobile bind
-        if [ -f "./tool/go" ]; then
-          echo "Using tool/go for gomobile bind"
-          ./tool/go run golang.org/x/mobile/cmd/gomobile bind -androidapi=21 -target=android/arm,android/arm64 -o libtailscale.aar ./libtailscale
-        else
-          echo "Using system gomobile bind"
-          gomobile bind -androidapi=21 -target=android/arm,android/arm64 -o libtailscale.aar ./libtailscale
-        fi
+        export PATH=$PATH:$HOME/go/bin
+        gomobile bind -target=android/arm,android/arm64 -androidapi=21 -o libtailscale.aar ./libtailscale
         
     - name: Create tailscale.version file
       run: |
         cd tailscale-android
-        # Generate version file using mkversion tool
+        export PATH=$PATH:$HOME/go/bin
         ./tool/go run tailscale.com/cmd/mkversion > tailscale.version
         cat tailscale.version
         
