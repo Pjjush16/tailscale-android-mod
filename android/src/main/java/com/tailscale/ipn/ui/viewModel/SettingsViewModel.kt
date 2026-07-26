@@ -43,8 +43,6 @@ class SettingsViewModel : IpnViewModel() {
 
   init {
     isClientRemoteLoggingEnabled.set(App.get().isClientLoggingEnabled())
-    isSplitTunnelEnabled.set(App.get().isSplitTunnelEnabled())
-    isProxyModeEnabled.set(App.get().isProxyModeEnabled())
 
     viewModelScope.launch {
       Notifier.netmap.collect { netmap -> isAdmin.set(netmap?.SelfNode?.isAdmin ?: false) }
@@ -70,11 +68,9 @@ class SettingsViewModel : IpnViewModel() {
 
   fun toggleSplitTunnel() {
     isSplitTunnelEnabled.set(!isSplitTunnelEnabled.value)
-    App.get().setSplitTunnelEnabled(isSplitTunnelEnabled.value)
   }
 
   fun toggleProxyMode() {
     isProxyModeEnabled.set(!isProxyModeEnabled.value)
-    App.get().setProxyModeEnabled(isProxyModeEnabled.value)
   }
 }
