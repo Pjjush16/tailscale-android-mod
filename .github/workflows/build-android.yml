@@ -82,6 +82,14 @@ jobs:
         ./tool/go run tailscale.com/cmd/mkversion > tailscale.version
         cat tailscale.version
         
+    - name: Copy AAR to libs directory
+      run: |
+        cd tailscale-android
+        mkdir -p android/libs
+        cp libtailscale.aar android/libs/
+        echo "AAR copied to android/libs/"
+        ls -lh android/libs/
+        
     - name: Build APK
       run: |
         cd tailscale-android/android
